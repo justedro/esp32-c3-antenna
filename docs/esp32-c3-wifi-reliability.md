@@ -62,6 +62,10 @@ STA OK  IP=<dhcp-ip>  RSSI=-49  TX=60
 5. If SoftAP is invisible even against the phone and scans still work → suspect bad board/antenna (RX-only).
 6. Power: short USB cable / solid 5 V supply; RF TX spikes can brown out flaky supplies.
 
+## Power saving (WiFi stays associated)
+
+See [esp32-c3-power-saving.md](./esp32-c3-power-saving.md) for Espressif sources and the full ladder. Firmware: connect with `PS_NONE`, then `MIN_MODEM` + 80 MHz CPU + `delay(1)` in `loop()`; fall back to `PS_NONE` on reason 34. Check serial `[PWR]…` or `GET /api/status` (`wifi_ps` / `cpu_mhz`).
+
 ## Code location
 
 STA connect ladder + SoftAP fallback live in `src/main.cpp` (`connectSta` / `startSoftAp`). WiFi credentials and Novy channel: `include/secrets.h` (gitignored; see `secrets.example.h`).
@@ -105,6 +109,6 @@ Also:
 - ESP32-C3 Super Mini **off** breadboard (or antenna clear of it)
 - STX882 on **5V** + GND + DATA→GPIO4
 - **~220 µF** bulk cap at the TX (plus ceramic if available)
-- WiFi: platform `espressif32@7.0.1`, low TX power, `PS_NONE`
+- WiFi: platform `espressif32@7.0.1`, low TX power, connect with `PS_NONE` then `MIN_MODEM` + 80 MHz CPU
 - Control over STA WiFi; Flipper sees steady Novy/RCSwitch bursts when commands are sent from the web UI
 - No WiFi dropouts observed in this configuration

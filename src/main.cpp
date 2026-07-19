@@ -50,6 +50,8 @@ uint32_t lastMqttAttemptMs = 0;
 
 void sendNovy(NovyCmd cmd);  // defined below
 bool executeCmd(String cmd);
+const char* wifiPsName(wifi_ps_type_t ps);
+void applyWifiPowerSave(bool enableModemSleep);
 
 void sendNovy(NovyCmd cmd) {
   const char* command = NOVY_COMMAND_LIGHT;
@@ -239,6 +241,8 @@ bool mqttConnect() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1024);
+  // Default 15s is fine with MIN_MODEM; keep headroom vs DTIM wake latency.
+  mqtt.setKeepAlive(30);
 
   const String lwt = mqttTopic("status");
   bool ok = false;
@@ -506,11 +510,24 @@ void handleStatus() {
   json += sta ? WIFI_SSID : AP_SSID;
   json += "\",\"mqtt\":";
   json += mqtt.connected() ? "true" : "false";
-  json += "}";
+  json += ",\"cpu_mhz\":";
+  json += String(getCpuFrequencyMhz());
+  json += ",\"wifi_ps\":\"";
+  {
+    wifi_ps_type_t ps = WIFI_PS_NONE;
+    if (sta) {
+      esp_wifi_get_ps(&ps);
+    }
+    json += wifiPsName(ps);
+  }
+  json += "\"}";
   server.send(200, "application/json", json);
 }
 
 static volatile uint8_t gLastDisconnectReason = 0;
+// Modem sleep after assoc saves heat; fall back to PS_NONE if reason 34 returns.
+static bool gModemSleepAllowed = true;
+static bool gModemSleepActive = false;
 
 const char* wifiReasonName(uint8_t r) {
   switch (r) {
@@ -526,6 +543,33 @@ const char* wifiReasonName(uint8_t r) {
   }
 }
 
+const char* wifiPsName(wifi_ps_type_t ps) {
+  switch (ps) {
+    case WIFI_PS_NONE: return "NONE";
+    case WIFI_PS_MIN_MODEM: return "MIN_MODEM";
+    case WIFI_PS_MAX_MODEM: return "MAX_MODEM";
+    default: return "?";
+  }
+}
+
+void applyWifiPowerSave(bool enableModemSleep) {
+  if (enableModemSleep && gModemSleepAllowed) {
+    // MIN_MODEM: wake every DTIM — keeps association, AP buffers unicast (MQTT/HTTP).
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+    gModemSleepActive = true;
+  } else {
+    WiFi.setSleep(WIFI_PS_NONE);
+    gModemSleepActive = false;
+  }
+  wifi_ps_type_t ps = WIFI_PS_NONE;
+  esp_wifi_get_ps(&ps);
+  Serial.print(F("[PWR] WiFi PS="));
+  Serial.print(wifiPsName(ps));
+  Serial.print(F(" CPU="));
+  Serial.print(getCpuFrequencyMhz());
+  Serial.println(F(" MHz"));
+}
+
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     gLastDisconnectReason = info.wifi_sta_disconnected.reason;
@@ -534,6 +578,12 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.print(F(" ("));
     Serial.print(wifiReasonName(gLastDisconnectReason));
     Serial.println(')');
+    // Modem sleep contributed to missing ACKs during bring-up — disable for session.
+    if (gLastDisconnectReason == 34 && gModemSleepActive) {
+      gModemSleepAllowed = false;
+      applyWifiPowerSave(false);
+      Serial.println(F("[PWR] reason 34 → PS_NONE for this session"));
+    }
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
     Serial.print(F("\n[WiFi] got IP "));
     Serial.println(WiFi.localIP());
@@ -668,7 +718,8 @@ bool connectSta() {
 
 connected:
   WiFi.setAutoReconnect(true);
-  esp_wifi_set_ps(WIFI_PS_NONE);
+  // Assoc used PS_NONE; enable modem sleep only after the link is up.
+  applyWifiPowerSave(true);
   Serial.print(F("STA OK  IP="));
   Serial.print(WiFi.localIP());
   Serial.print(F("  RSSI="));
@@ -729,6 +780,12 @@ void setup() {
     startSoftAp();
   }
 
+  // 80 MHz is enough for HTTP/MQTT/RF and cuts idle heat vs 160 MHz.
+  setCpuFrequencyMhz(80);
+  Serial.print(F("[PWR] CPU set to "));
+  Serial.print(getCpuFrequencyMhz());
+  Serial.println(F(" MHz"));
+
   // RF ready only after WiFi assoc — reduce boot-time rail stress
   transmitter.disableTransmit();
   digitalWrite(PIN_TX, LOW);
@@ -752,25 +809,26 @@ void loop() {
   server.handleClient();
   mqttLoop();
 
-  // Keep power-save off (modem sleep → missing ACKs → reason 34)
-  static uint32_t lastPs = 0;
-  if (millis() - lastPs > 10000) {
-    lastPs = millis();
-    if (WiFi.status() == WL_CONNECTED) {
-      esp_wifi_set_ps(WIFI_PS_NONE);
-    }
-  }
+  // Yield so FreeRTOS idle can run — busy-spin was a major heat source.
+  delay(1);
 
   static uint32_t lastMs = 0;
   const uint32_t now = millis();
-  if (now - lastMs >= 5000) {
+  if (now - lastMs >= 15000) {
     lastMs = now;
     digitalWrite(PIN_LED, !digitalRead(PIN_LED));
     if (WiFi.status() == WL_CONNECTED) {
+      wifi_ps_type_t ps = WIFI_PS_NONE;
+      esp_wifi_get_ps(&ps);
       Serial.print(F("[STA] IP="));
       Serial.print(WiFi.localIP());
       Serial.print(F(" RSSI="));
-      Serial.println(WiFi.RSSI());
+      Serial.print(WiFi.RSSI());
+      Serial.print(F(" PS="));
+      Serial.print(wifiPsName(ps));
+      Serial.print(F(" CPU="));
+      Serial.print(getCpuFrequencyMhz());
+      Serial.println(F(" MHz"));
     } else if (WiFi.getMode() & WIFI_AP) {
       Serial.print(F("[AP] stations="));
       Serial.print(WiFi.softAPgetStationNum());
